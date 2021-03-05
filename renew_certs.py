@@ -1,32 +1,40 @@
 #! /usr/bin/env python
-# request module to query api
 import requests
-# salt api to make salt calls
 import salt.client
+import json
 
-# configuring salt client
 master = salt.client.LocalClient()
-# salt call to get ip of mon 
-res = master.cmd('cfg*','pillar.items', ['linux:network:host:mon:address'])
+res = master.cmd('cfg*', 'pillar.items', ['linux:network:host:mon:address'])
 for a in res:
     ip = res[a]['linux:network:host:mon:address']
 
 url = "http://{ip}:15011/api/v1/alerts".format(ip=ip)
 
 r = requests.get(url)
-data = r.json()
-query = data['data']
+data = r.json()['data']
 
-# looping through retuned json data from api query
-for i in range(len(query)):
-    if query[i]['labels']['alertname'] in {'CertificateExpirationWarning','CertificateExpirationCritical'}:
-        host = query[i]['labels']['host']
-        cert = query[i]['labels']['source']
-        cert_issuer = master.cmd(host+'*', 'cmd.run', ['openssl x509 -issuer -noout -in '+cert])
-        cert_date = master.cmd(host+'*', 'cmd.run', ['openssl x509 -dates -noout -in '+cert])
-        cert_expiry = cert_date.values()[0].split("\n")[1].split('=')[1]
-        issuer = cert_issuer.values()[0].split("/")[2]
-        if issuer == 'CN=Salt Master CA':
-            print('cert: {cert} on {host} is expiring on {cert_expiry}signed by {issuer} and can be renewed.'.format(cert=cert,host=host,issuer=issuer,cert_expiry=cert_expiry))
-        else:
-            pass
+
+def simplify(alert):
+    if alert['labels']['alertname'] in {'CertificateExpirationWarning',
+                                        'CertificateExpirationCritical'}:
+        return {
+            'host': alert['labels']['host'],
+            'file': alert['labels']['source']
+        }
+
+alerts = list(filter(None, map(simplify, data)))
+
+for alert in alerts:
+    host = alert['host']
+    cert = alert['file']
+    cert_issuer = master.cmd(host+'*', 'cmd.run',
+                             ['openssl x509 -issuer -noout -in ' + cert])
+    cert_date = master.cmd(host+'*', 'cmd.run',
+                           ['openssl x509 -enddate -noout -in ' + cert])
+    cert_expiry = cert_date.values()[0].split('=')[1]
+    issuer = cert_issuer.values()[0].split(" ", 1)[1]
+    if any("CN=Salt Master CA" in word for word in cert_issuer.values()):
+        print("cert: {cert} on {host} is expiring on {cert_expiry} "
+              "signed by {issuer} and can be renewed"
+              .format(cert=cert, host=host, issuer=issuer,
+                      cert_expiry=cert_expiry))
