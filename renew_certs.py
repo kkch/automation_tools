@@ -2,7 +2,24 @@
 import requests
 import salt.client
 import json
+import logging
+import sys
+import argparse
 from datetime import date
+
+logfile = 'renew_cert.log'
+logging.basicConfig(
+    level=logging.DEBUG,
+    format='%(asctime)s - %(levelname)s: %(message)s', 
+    datefmt='%m/%d/%Y %I:%M:%S %p',
+    handlers=[
+            logging.FileHandler(logfile),
+            logging.StreamHandler(sys.stdout)])
+
+parser = argprase.Argumentparse(prog='Renew Certs')
+parser.add_argument('--test', '-t' ,action='store_true', help='Run script in dryrun mode')
+parser.add_argument('--version', '-v', action='version', version='%(prog)s 1.0')
+args = parser.parse_args()
 
 master = salt.client.LocalClient()
 res = master.cmd('cfg*', 'pillar.items', ['linux:network:host:mon:address'])
@@ -56,8 +73,10 @@ for alert in alerts:
     if any("CN=Salt Master CA" in word for word in cert_issuer.values()):
         result = master.cmd('*' + host + '*', 'file.rename',
                             [cert, cert+timestamp])
+        logging.info("[{host}] - {cert} backed up"
+                  .format(cert=cert, host=host))
         if any("ERROR" in word for word in result.values()):
-            print("[{host}] ERROR - could not back up {cert}"
+            logging.error("[{host}] - could not back up {cert}"
                   .format(cert=cert, host=host))
             continue
         service = [ele for ele in services if(ele in cert)]
@@ -66,51 +85,78 @@ for alert in alerts:
 for key in servers:
     host = key
     services = servers[key]
-    master.cmd('*' + host + '*', 'state.sls', ['salt.minion.grains'])
-    master.cmd('*' + host + '*', 'state.sls', ['salt.minion.cert'])
-    for service in services:
-        if service == "td-agent":
-            result = master.cmd('*' + host + '*', 'service.restart', [service])
-            if any("ERROR" in word for word in result.values()):
-                print("[{host}] ERROR - could not restart service: "
-                      "{service}".format(host=host, service=service))
-        if service == "telegraf":
-            result = master.cmd('*' + host + '*', 'service.restart', [service])
-            if any("ERROR" in word for word in result.values()):
-                print("[{host}] ERROR - could not restart service: "
-                      "{service}".format(host=host, service=service))
-        if service == "mysql":
-            result = master.cmd('*' + host + '*', 'service.restart', [service])
-            if any("ERROR" in word for word in result.values()):
-                print("[{host}] ERROR - could not restart service: "
-                      "{service}".format(host=host, service=service))
-        if service == "libvirt":
-            service = 'libvirtd'
-            if "cmp" in host:
-                result = master.cmd('*' + host + '*', 'service.restart',
-                                    [service])
+    if args.test:
+        master.cmd('*' + host + '*', 'state.sls', ['salt.minion.grains',
+            'test={arg}'.format(arg=args.test)])
+        master.cmd('*' + host + '*', 'state.sls', ['salt.minion.cert',
+            'test={arg}'.format(arg=args.test)])
+    else:
+        master.cmd('*' + host + '*', 'state.sls', ['salt.minion.grains'])
+        master.cmd('*' + host + '*', 'state.sls', ['salt.minion.cert'])
+        for service in services:
+            if service == "td-agent":
+                result = master.cmd('*' + host + '*', 'service.restart', [service])
                 if any("ERROR" in word for word in result.values()):
-                    print("[{host}] ERROR - could not restart service: "
+                    logging.error("[{host}] - could not restart service: "
                           "{service}".format(host=host, service=service))
-        if service == "rabbitmq":
-            service = 'rabbitmq-server'
-            if "msg" in host:
-                result = master.cmd('*' + host + '*', 'service.restart',
-                                    [service])
+                else:
+                    logging.info("[{host}] - restarted {service} service "
+                        .format(host=host, service=service))
+            if service == "telegraf": 
+                result = master.cmd('*' + host + '*', 'service.restart', [service])
                 if any("ERROR" in word for word in result.values()):
-                    print("[{host}] ERROR - could not restart service: "
+                    logging.error("[{host}] - could not restart service: "
                           "{service}".format(host=host, service=service))
-        if service == "nova-novncproxy":
-            if "ctl" in host:
-                result = master.cmd('*' + host + '*', 'service.restart',
-                                    [service])
+                else:
+                    logging.info("[{host}] - restarted {service} service "
+                        .format(host=host, service=service))
+            if service == "mysql":
+                result = master.cmd('*' + host + '*', 'service.restart', [service])
                 if any("ERROR" in word for word in result.values()):
-                    print("[{host}] ERROR - could not restart service: "
+                    logging.error("[{host}] - could not restart service: "
                           "{service}".format(host=host, service=service))
-        if service == "salt-api":
-            if "cfg" in host:
-                result = master.cmd('*' + host + '*', 'service.restart',
-                                    [service])
-                if any("ERROR" in word for word in result.values()):
-                    print("[{host}] ERROR - could not restart service: "
-                          "{service}".format(host=host, service=service))
+                else:
+                    logging.info("[{host}] - restarted {service} service "
+                        .format(host=host, service=service))
+            if service == "libvirt":
+                service = 'libvirtd'
+                if "cmp" in host:
+                    result = master.cmd('*' + host + '*', 'service.restart',
+                                        [service])
+                    if any("ERROR" in word for word in result.values()):
+                        logging.error("[{host}] - could not restart service: "
+                              "{service}".format(host=host, service=service))
+                    else:
+                        logging.info("[{host}] - restarted {service} service "
+                            .format(host=host, service=service))
+            if service == "rabbitmq":
+                service = 'rabbitmq-server'
+                if "msg" in host:
+                    result = master.cmd('*' + host + '*', 'service.restart',
+                                        [service])
+                    if any("ERROR" in word for word in result.values()):
+                        logging.error("[{host}] - could not restart service: "
+                              "{service}".format(host=host, service=service))
+                    else:
+                        logging.info("[{host}] - restarted {service} service "
+                            .format(host=host, service=service))
+            if service == "nova-novncproxy":
+                if "ctl" in host:
+                    result = master.cmd('*' + host + '*', 'service.restart',
+                                        [service])
+                    if any("ERROR" in word for word in result.values()):
+                        logging.error("[{host}] - could not restart service: "
+                              "{service}".format(host=host, service=service))
+                    else:
+                        logging.info("[{host}] - restarted {service} service "
+                              .format(host=host, service=service))
+            if service == "salt-api":
+                if "cfg" in host:
+                    result = master.cmd('*' + host + '*', 'service.restart',
+                                        [service])
+                    if any("ERROR" in word for word in result.values()):
+                        logging.error("[{host}] - could not restart service: "
+                              "{service}".format(host=host, service=service))
+                    else:
+                        logging.info("[{host}] - restarted {service} service "
+                            .format(host=host, service=service))
