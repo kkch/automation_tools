@@ -5,42 +5,9 @@ import json
 import logging
 import sys
 import argparse
-from datetime import date
+from datetime import datetime
 
-logfile = 'renew_cert.log'
-logging.basicConfig(
-    level=logging.DEBUG,
-    format='%(asctime)s - %(levelname)s: %(message)s', 
-    datefmt='%m/%d/%Y %I:%M:%S %p',
-    handlers=[
-            logging.FileHandler(logfile),
-            logging.StreamHandler(sys.stdout)])
-
-parser = argprase.Argumentparse(prog='Renew Certs')
-parser.add_argument('--test', '-t' ,action='store_true', help='Run script in dryrun mode')
-parser.add_argument('--version', '-v', action='version', version='%(prog)s 1.0')
-args = parser.parse_args()
-
-master = salt.client.LocalClient()
-res = master.cmd('cfg*', 'pillar.items', ['linux:network:host:mon:address'])
-for a in res:
-    ip = res[a]['linux:network:host:mon:address']
-
-url = "http://{ip}:15011/api/v1/alerts".format(ip=ip)
-
-r = requests.get(url)
-data = r.json()['data']
-
-
-def simplify(alert):
-    if alert['labels']['alertname'] in {'CertificateExpirationWarning',
-                                        'CertificateExpirationCritical'}:
-        return {
-            'host': alert['labels']['host'],
-            'file': alert['labels']['source']
-        }
-
-alerts = list(filter(None, map(simplify, data)))
+timestamp = date.now().strftime("%d%b%Y%H%M")
 
 services = ['td-agent',
             'telegraf',
@@ -50,13 +17,54 @@ services = ['td-agent',
             'nova-novncproxy',
             'salt-api']
 
-timestamp = date.today().strftime("%d%b%Y")
-
 servers = {}
 
+def parse_argument():
+    '''Parse commandline arguments'''
+    logfile = '/tmp/renew_cert.log.{timestamp}'.format(timestamp=timestamp)
+    logging.basicConfig(
+        level=logging.DEBUG,
+        format='%(asctime)s - %(levelname)s: %(message)s',
+        datefmt='%m/%d/%Y %I:%M:%S %p',
+        handlers=[
+                logging.FileHandler(logfile),
+                logging.StreamHandler(sys.stdout)])
+
+    parser = argprase.Argumentparse(prog='Renew Certs')
+    parser.add_argument('--test', '-t', action='store_true',
+                        help='Run script in dryrun mode')
+    parser.add_argument('--version', '-v', action='version',
+                        version='%(prog)s 1.0')
+    args = parser.parse_args()
+    return args
+
+def parse_alerts():
+    '''Parse all firing alerts'''
+    master = salt.client.LocalClient()
+    res = master.cmd('cfg*', 'pillar.items',
+                     ['linux:network:host:mon:address'])
+    for a in res:
+        ip = res[a]['linux:network:host:mon:address']
+
+    url = "http://{ip}:15011/api/v1/alerts".format(ip=ip)
+
+    r = requests.get(url)
+    data = r.json()['data']
+    return data
+
+def simplify(alert):
+    '''Filter cert alerts'''
+    if alert['labels']['alertname'] in {'CertificateExpirationWarning',
+                                        'CertificateExpirationCritical'}:
+        logging.info("[{host}] - {file} cert is expiring"
+            .format(host=alert['labels']['host'],file=alert['labels']['source']))
+        return {
+            'host': alert['labels']['host'],
+            'file': alert['labels']['source']
+        }
 
 def add_values_in_dict(sample_dict, key, list_of_values):
-    """Append multiple values to a key in the given dictionary"""
+    '''Append multiple values to a key in the given dictionary'''
     if key not in sample_dict:
         sample_dict[key] = list()
     sample_dict[key].extend(list_of_values)
@@ -65,98 +73,139 @@ def add_values_in_dict(sample_dict, key, list_of_values):
     sample_dict[key] = temp_list
     return sample_dict
 
-for alert in alerts:
-    host = alert['host']
-    cert = alert['file']
-    cert_issuer = master.cmd('*' + host + '*', 'cmd.run',
-                             ['openssl x509 -issuer -noout -in ' + cert])
-    if any("CN=Salt Master CA" in word for word in cert_issuer.values()):
-        result = master.cmd('*' + host + '*', 'file.rename',
-                            [cert, cert+timestamp])
-        logging.info("[{host}] - {cert} backed up"
-                  .format(cert=cert, host=host))
-        if any("ERROR" in word for word in result.values()):
-            logging.error("[{host}] - could not back up {cert}"
-                  .format(cert=cert, host=host))
-            continue
-        service = [ele for ele in services if(ele in cert)]
-        servers = add_values_in_dict(servers, host, service)
+def beckup_certs(args):
+    '''Back up certs only in non-dryrun mode'''
+    for alert in alerts:
+        host = alert['host']
+        cert = alert['file']
+        cert_issuer = master.cmd('*' + host + '*', 'cmd.run',
+                                 ['openssl x509 -issuer -noout -in ' + cert])
+        if not args.test:
+            if any("CN=Salt Master CA" in word for word in cert_issuer.values()):
+                result = master.cmd('*' + host + '*', 'file.rename',
+                                    [cert, cert+timestamp])
+                logging.info("[{host}] - {cert} backed up"
+                             .format(cert=cert, host=host))
+                if any("ERROR" in word for word in result.values()):
+                    logging.error("[{host}] - could not back up {cert}"
+                                  .format(cert=cert, host=host))
+                    continue
+                service = [ele for ele in services if(ele in cert)]
+                servers = add_values_in_dict(servers, host, service)
+                logging.info("{servers}" - "{service}".format(servers=servers,service=service)) #TODO unpack servers dict
+        else:
+            if any("CN=Salt Master CA" in word for word in cert_issuer.values()):
+                result = master.cmd('*' + host + '*', 'file.rename',
+                                    [cert, cert+timestamp])
+                logging.info("Dryrun: [{host}] - {cert} would have backed up"
+                             .format(cert=cert, host=host))
+                service = [ele for ele in services if(ele in cert)]
+                servers = add_values_in_dict(servers, host, service)
+                logging.info("{servers}" - "{service}".format(servers=servers,service=service)) #TODO unpack servers dict
 
-for key in servers:
-    host = key
-    services = servers[key]
-    if args.test:
-        master.cmd('*' + host + '*', 'state.sls', ['salt.minion.grains',
-            'test={arg}'.format(arg=args.test)])
-        master.cmd('*' + host + '*', 'state.sls', ['salt.minion.cert',
-            'test={arg}'.format(arg=args.test)])
-    else:
-        master.cmd('*' + host + '*', 'state.sls', ['salt.minion.grains'])
-        master.cmd('*' + host + '*', 'state.sls', ['salt.minion.cert'])
-        for service in services:
-            if service == "td-agent":
-                result = master.cmd('*' + host + '*', 'service.restart', [service])
-                if any("ERROR" in word for word in result.values()):
-                    logging.error("[{host}] - could not restart service: "
-                          "{service}".format(host=host, service=service))
-                else:
-                    logging.info("[{host}] - restarted {service} service "
-                        .format(host=host, service=service))
-            if service == "telegraf": 
-                result = master.cmd('*' + host + '*', 'service.restart', [service])
-                if any("ERROR" in word for word in result.values()):
-                    logging.error("[{host}] - could not restart service: "
-                          "{service}".format(host=host, service=service))
-                else:
-                    logging.info("[{host}] - restarted {service} service "
-                        .format(host=host, service=service))
-            if service == "mysql":
-                result = master.cmd('*' + host + '*', 'service.restart', [service])
-                if any("ERROR" in word for word in result.values()):
-                    logging.error("[{host}] - could not restart service: "
-                          "{service}".format(host=host, service=service))
-                else:
-                    logging.info("[{host}] - restarted {service} service "
-                        .format(host=host, service=service))
-            if service == "libvirt":
-                service = 'libvirtd'
-                if "cmp" in host:
-                    result = master.cmd('*' + host + '*', 'service.restart',
-                                        [service])
+def renew_certs(args):
+    '''renew certs and restart services'''
+    for key in servers:
+        host = key
+        services = servers[key]
+        if args.test:
+            master.cmd('*' + host + '*', 'state.sls', ['salt.minion.grains',
+                                                       'test={arg}'.format(
+                                                           arg=args.test)])
+            logging.info("Dryrun: [{host}] - salt.minion.grains state did not apply"
+                            .format(host=host))
+            master.cmd('*' + host + '*', 'state.sls', ['salt.minion.cert',
+                                                       'test={arg}'.format(
+                                                           arg=args.test)])
+            logging.info("Dryrun: [{host}] - salt.minion.cert state did not apply - Dryrun"
+                            .format(host=host))
+        else:
+            master.cmd('*' + host + '*', 'state.sls', ['salt.minion.grains'])
+            master.cmd('*' + host + '*', 'state.sls', ['salt.minion.cert'])
+            for service in services:
+                if service == "td-agent":
+                    result = master.cmd(
+                        '*' + host + '*', 'service.restart', [service])
                     if any("ERROR" in word for word in result.values()):
                         logging.error("[{host}] - could not restart service: "
-                              "{service}".format(host=host, service=service))
+                                      "{service}".format(
+                                          host=host, service=service))
                     else:
                         logging.info("[{host}] - restarted {service} service "
-                            .format(host=host, service=service))
-            if service == "rabbitmq":
-                service = 'rabbitmq-server'
-                if "msg" in host:
-                    result = master.cmd('*' + host + '*', 'service.restart',
-                                        [service])
+                                     .format(host=host, service=service))
+                if service == "telegraf":
+                    result = master.cmd(
+                        '*' + host + '*', 'service.restart', [service])
                     if any("ERROR" in word for word in result.values()):
                         logging.error("[{host}] - could not restart service: "
-                              "{service}".format(host=host, service=service))
+                                      "{service}".format(
+                                          host=host, service=service))
                     else:
                         logging.info("[{host}] - restarted {service} service "
-                            .format(host=host, service=service))
-            if service == "nova-novncproxy":
-                if "ctl" in host:
-                    result = master.cmd('*' + host + '*', 'service.restart',
-                                        [service])
+                                     .format(host=host, service=service))
+                if service == "mysql":
+                    result = master.cmd(
+                        '*' + host + '*', 'service.restart', [service])
                     if any("ERROR" in word for word in result.values()):
                         logging.error("[{host}] - could not restart service: "
-                              "{service}".format(host=host, service=service))
+                                      "{service}".format(
+                                          host=host, service=service))
                     else:
                         logging.info("[{host}] - restarted {service} service "
-                              .format(host=host, service=service))
-            if service == "salt-api":
-                if "cfg" in host:
-                    result = master.cmd('*' + host + '*', 'service.restart',
-                                        [service])
-                    if any("ERROR" in word for word in result.values()):
-                        logging.error("[{host}] - could not restart service: "
-                              "{service}".format(host=host, service=service))
-                    else:
-                        logging.info("[{host}] - restarted {service} service "
-                            .format(host=host, service=service))
+                                     .format(host=host, service=service))
+                if service == "libvirt":
+                    service = 'libvirtd'
+                    if "cmp" in host:
+                        result = master.cmd('*' + host + '*', 'service.restart',
+                                            [service])
+                        if any("ERROR" in word for word in result.values()):
+                            logging.error("[{host}] - could not restart service: "
+                                          "{service}".format(
+                                              host=host, service=service))
+                        else:
+                            logging.info("[{host}] - restarted {service} service "
+                                         .format(host=host, service=service))
+                if service == "rabbitmq":
+                    service = 'rabbitmq-server'
+                    if "msg" in host:
+                        result = master.cmd('*' + host + '*', 'service.restart',
+                                            [service])
+                        if any("ERROR" in word for word in result.values()):
+                            logging.error("[{host}] - could not restart service: "
+                                          "{service}".format(
+                                              host=host, service=service))
+                        else:
+                            logging.info("[{host}] - restarted {service} service "
+                                         .format(host=host, service=service))
+                if service == "nova-novncproxy":
+                    if "ctl" in host:
+                        result = master.cmd('*' + host + '*', 'service.restart',
+                                            [service])
+                        if any("ERROR" in word for word in result.values()):
+                            logging.error("[{host}] - could not restart service: "
+                                          "{service}".format(
+                                              host=host, service=service))
+                        else:
+                            logging.info("[{host}] - restarted {service} service "
+                                         .format(host=host, service=service))
+                if service == "salt-api":
+                    if "cfg" in host:
+                        result = master.cmd('*' + host + '*', 'service.restart',
+                                            [service])
+                        if any("ERROR" in word for word in result.values()):
+                            logging.error("[{host}] - could not restart service: "
+                                          "{service}".format(
+                                              host=host, service=service))
+                        else:
+                            logging.info("[{host}] - restarted {service} service "
+                                         .format(host=host, service=service))
+
+def main():
+    args = parse_argument()
+    data = parse_alerts()
+    alerts = list(filter(None, map(simplify, data)))
+    backup_certs(args)
+    renew_certs(args)
+
+if __name__ == "__main__":
+    main()
