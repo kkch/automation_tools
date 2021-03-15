@@ -1,13 +1,14 @@
 #! /usr/bin/env python
 import requests
 import salt.client
+import salt
 import json
 import logging
 import sys
 import argparse
 from datetime import datetime
 
-timestamp = date.now().strftime("%d%b%Y%H%M")
+timestamp = datetime.now().strftime("%d%b%Y%H%M")
 
 services = ['td-agent',
             'telegraf',
@@ -20,19 +21,18 @@ services = ['td-agent',
 servers = {}
 
 logfile = '/tmp/renew_cert.log.{timestamp}'.format(timestamp=timestamp)
-logging.basicConfig(level=logging.DEBUG,
+logging.basicConfig(filename=logfile, level=logging.DEBUG,
                     format='%(asctime)s - %(levelname)s: %(message)s',
-                    datefmt='%m/%d/%Y %I:%M:%S %p',
-                    handlers=[logging.FileHandler(logfile),
-                              logging.StreamHandler(sys.stdout)])
+                    datefmt='%m/%d/%Y %I:%M:%S %p')
 
 master = salt.client.LocalClient()
 
-errors_countered = "false"
+errors_countered = False
+
 
 def parse_argument():
     """Parse commandline arguments"""
-    parser = argprase.Argumentparse(prog='Renew Certs')
+    parser = argparse.ArgumentParser(prog='Renew Certs')
     parser.add_argument('--test', '-t', action='store_true',
                         help='Run script in dryrun mode')
     parser.add_argument('--version', '-v', action='version',
@@ -43,28 +43,40 @@ def parse_argument():
 
 def generate_url():
     """Generate url from Salt pillar data"""
-    res = master.cmd('cfg*', 'pillar.items',
-                     ['linux:network:host:mon:address'])
+    try:
+        res = master.cmd('cfg*', 'pillar.items',
+                         ['linux:network:host:mon:address'])
+    except salt.exceptions.EauthAuthenticationError as e:
+        logging.error(e)
+        sys.exit('Run as root or sudo')
     for a in res:
         ip = res[a]['linux:network:host:mon:address']
     url = "http://{ip}:15011/api/v1/alerts".format(ip=ip)
-    return url        
+    return url
 
 
 def gather_alerts(url):
     """Gather all firing alerts"""
-    r = requests.get(url)
-    if r.status_code == 200:
-        data = r.json()['data']
-        return data
-    #else log could not get data and exit
+    try:
+        r = requests.get(url)
+    except requests.ConnectionError as e:
+        logging.error(e)
+        sys.exit("An ERROR occured while connecting to api endpoint."
+                 " Check logs for details")
+    else:
+        if r.status_code == 200:
+            data = r.json()['data']
+            return data
+        else:
+            logging.error('Could not get the data,status code {status_code}'
+                          .format(status_code=r.status_code))
+            sys.exit("Error!! Cloud not get the data, Check the logs!")
+
 
 def simplify(alert):
     """Filter cert alerts"""
     if alert['labels']['alertname'] in {'CertificateExpirationWarning',
                                         'CertificateExpirationCritical'}:
-#        logging.info("[{host}] - {file} cert is expiring"
-#            .format(host=alert['labels']['host'],file=alert['labels']['source']))
         return {
             'host': alert['labels']['host'],
             'file': alert['labels']['source']
@@ -92,17 +104,16 @@ def backup_certs(args):
         if any("CN=Salt Master CA" in word for word in cert_issuer.values()):
             if not args.test:
                 logging.info("[{host}] - backing up {cert}"
-                             .format(cert=cert, host=host))                
+                             .format(cert=cert, host=host))
                 result = master.cmd('*' + host + '*', 'file.rename',
                                     [cert, cert+timestamp])
                 if any("ERROR" in word for word in result.values()):
                     logging.error("[{host}] - could not back up {cert}"
                                   .format(cert=cert, host=host))
-                    errors_countered = "true"
+                    errors_countered = True
                     continue
             service = [ele for ele in services if(ele in cert)]
             servers = add_values_in_dict(servers, host, service)
-#                logging.info("{servers}" - "{service}".format(servers=servers,service=service)) #TODO unpack servers dict
 
 
 def renew_certs(args):
@@ -118,17 +129,18 @@ def renew_certs(args):
             master.cmd('*' + host + '*', 'state.sls', ['salt.minion.cert',
                                                        'test=true'])
             logging.info("Dryrun: [{host}] - salt.minion.cert state"
-                            .format(host=host))
+                         .format(host=host))
         else:
             master.cmd('*' + host + '*', 'state.sls', ['salt.minion.grains'])
             master.cmd('*' + host + '*', 'state.sls', ['salt.minion.cert'])
             for service in services:
                 logging.info("[{host}] - restarting {service}"
-                             .format(host=host, service=service))                
+                             .format(host=host, service=service))
                 if service == "td-agent":
                     result = master.cmd(
                         '*' + host + '*', 'service.restart', [service])
                     if any("ERROR" in word for word in result.values()):
+                        errors_countered = True
                         logging.error("[{host}] - could not restart service: "
                                       "{service}".format(
                                           host=host, service=service))
@@ -136,6 +148,7 @@ def renew_certs(args):
                     result = master.cmd(
                         '*' + host + '*', 'service.restart', [service])
                     if any("ERROR" in word for word in result.values()):
+                        errors_countered = True
                         logging.error("[{host}] - could not restart service: "
                                       "{service}".format(
                                           host=host, service=service))
@@ -143,16 +156,18 @@ def renew_certs(args):
                     result = master.cmd(
                         '*' + host + '*', 'service.restart', [service])
                     if any("ERROR" in word for word in result.values()):
+                        errors_countered = True
                         logging.error("[{host}] - could not restart service: "
                                       "{service}".format(
                                           host=host, service=service))
                 if service == "libvirt":
                     service = 'libvirtd'
                     if "cmp" in host:
-                        result = master.cmd('*' + host + '*', 'service.restart',
-                                            [service])
+                        result = master.cmd('*' + host + '*',
+                                            'service.restart', [service])
                         if any("ERROR" in word for word in result.values()):
-                            logging.error("[{host}] - could not restart service: "
+                            errors_countered = True
+                            logging.error("[{host}] - could not restart service:"
                                           "{service}".format(
                                               host=host, service=service))
                 if service == "rabbitmq":
@@ -161,6 +176,7 @@ def renew_certs(args):
                         result = master.cmd('*' + host + '*', 'service.restart',
                                             [service])
                         if any("ERROR" in word for word in result.values()):
+                            errors_countered = True
                             logging.error("[{host}] - could not restart service: "
                                           "{service}".format(
                                               host=host, service=service))
@@ -169,6 +185,7 @@ def renew_certs(args):
                         result = master.cmd('*' + host + '*', 'service.restart',
                                             [service])
                         if any("ERROR" in word for word in result.values()):
+                            errors_countered = True
                             logging.error("[{host}] - could not restart service: "
                                           "{service}".format(
                                               host=host, service=service))
@@ -177,21 +194,33 @@ def renew_certs(args):
                         result = master.cmd('*' + host + '*', 'service.restart',
                                             [service])
                         if any("ERROR" in word for word in result.values()):
+                            errors_countered = True
                             logging.error("[{host}] - could not restart service: "
                                           "{service}".format(
                                               host=host, service=service))
 
 
 def main():
+    print("Staring script ....")
+    print("Parsing arguments ....")
     args = parse_argument()
+    print("Generating url ....")
     url = generate_url()
+    print("Gathering alerts ....")
     data = gather_alerts(url)
+    print("Filtering current alerts")
     alerts = list(filter(None, map(simplify, data)))
-    #print (log out) alerts
+    print(alerts)
+    print("backing up certs ....")
     backup_certs(args)
-    #print servers
+    print(servers)
+    print("Renewing certs ....")
     renew_certs(args)
-    #check errors_countered and return exit code 1 and print message errors encountered, check logs
+    if errors_countered:
+        sys.exit("Error !! Check logs for details")
+    else:
+        sys.exit()
+
 
 if __name__ == "__main__":
     main()
