@@ -68,9 +68,8 @@ def gather_alerts(url):
             data = r.json()['data']
             return data
         else:
-            logging.error('Could not get the data,status code {status_code}'
-                          .format(status_code=r.status_code))
-            sys.exit("Error!! Cloud not get the data, Check the logs!")
+            logging.error(r)
+            sys.exit("Error!! Could not get the data, Check the logs!")
 
 
 def simplify(alert):
@@ -95,7 +94,7 @@ def add_values_in_dict(sample_dict, key, list_of_values):
 
 
 def backup_certs(args):
-    """Back up certs only in non-dryrun mode"""
+    """Back up certs only in non-dry run mode"""
     for alert in alerts:
         host = alert['host']
         cert = alert['file']
@@ -210,10 +209,10 @@ def main():
     data = gather_alerts(url)
     print("Filtering current alerts")
     alerts = list(filter(None, map(simplify, data)))
-    print(alerts)
-    print("backing up certs ....")
+    logging.info(alerts)
+    print("backing up certs and restarting services ....")
     backup_certs(args)
-    print(servers)
+    logging.info(servers)
     print("Renewing certs ....")
     renew_certs(args)
     if errors_countered:
